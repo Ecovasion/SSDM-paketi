@@ -1,0 +1,256 @@
+
+
+---
+title: "TD37 SSDMI"
+author: "Dr. Burcu Mestav"
+date: "9/11/2020"
+output: html_document
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+ **Libraries** :)
+
+```{r results="hide", message=FALSE, warning=FALSE}
+
+rm(list=ls())
+library(psych)
+library(PerformanceAnalytics)
+library(tidyverse)
+library(summarytools)
+library(corrplot)
+library(car)
+library(Hmisc)
+library(plyr)
+library(lmtest)
+library(HH)
+library(scatterplot3d)
+library(ggiraphExtra)
+library(ggcorrplot)
+library(ggpubr)
+library(plotly)
+library(correlation)
+library(tidyr)
+library(vegan)
+library(SSDM)
+library(raster)
+library(sp)
+library(sf)
+library(scico)
+library(purrr)
+library(rgbif)
+library(rgdal)
+library(skimr)
+library(knitr)
+library(kableExtra)
+```
+
+
+## importing dataset
+
+
+```{r}
+
+spe=read_delim("dat/spe.txt", delim = "\t")
+
+
+attach(spe)
+
+glimpse(spe)
+skim(spe)
+
+spe1 = spe %>%
+  mutate(sites =paste("Site", c(1:30), sep="") )
+
+#species richness
+ddply(spe1,~sites,function(x) {
+  data.frame(RICHNESS=sum(x[-28]>0))
+ })
+
+## menhinick's index
+menhinick <- function(x) {                         sum(x>0)/sqrt(sum(x))
+ }
+ddply(spe1,~sites,function(x) {
+   data.frame(RICHNESS=menhinick(x[-28]))
+ })
+
+## menhinick' index
+menhinick <- function(x) {
+      (sum(x>0)-1)/log(sum(x))
+}
+ddply(spe1,~sites,function(x) {
+ data.frame(RICHNESS=menhinick(x[-28]))
+})
+
+
+#Diversity
+##SHANNON index
+ddply(spe1,~sites,function(x) {
+         data.frame(SHANNON=diversity(x[-28], index="shannon"))
+ })
+
+##SIMPSON index
+ddply(spe1,~sites,function(x) {
+        data.frame(SIMPSON=diversity(x[-28], index="simpson"))
+ })
+```
+
+**SSDM Paketine Girişi**
+
+Tür dağılım modellerini oluşturmak için çevresel değişkenlere ihtiyacınız olacak. "SSDM", "rgdal" R paketi tarafından desteklenen tüm tarama (*raster*) biçimlerini kullanmaktadır. "SSDM" paketi, girdi olarak hem sürekli (ör. İklim haritaları, dijital yükseklik modelleri, batimetrik haritalar) hem de kategorik çevresel değişkenleri (ör. Arazi örtüsü haritaları, toprak türü haritaları) destekler. Paket ayrıca, belirli algoritmaların (yapay sinir ağları veya destek vektör makineleri gibi) uyumunu iyileştirmek için faydalı olabilecek çevresel değişkenlerin normalleştirilmesine de izin verir.
+
+```{r Environmental variables}
+library(SSDM)
+library(raster)
+Env <- load_var(system.file('extdata',  package = 'SSDM'), categorical = 'SUBSTRATE', verbose = FALSE)
+Env
+```
+
+
+**Kendi çalışmanızda bu dosyayı hazırlamanız için raster’ları bulup RasterStack formatına dönüştürmeniz için bir örnek **
+
+```{r message=FALSE, warning=FALSE}
+# load the raster, sp, and rgdal packages
+library(raster)
+library(sp)
+library(rgdal)
+
+filename <- system.file("external/lux.shp", package="raster")
+filename
+
+# import tiffs
+band19 <- raster("dat/band19.tif")
+band34 <- raster("dat/band34.tif")
+band58 <- raster("dat/band58.tif")
+
+# create list of files to make raster stack
+rasterlist1 <-  list.files("RGB", full.names=TRUE)
+
+rasterlist2 <-  list.files('RGB', full.names=TRUE, pattern="tif") 
+
+
+# create raster stack
+rgbRaster <- stack(band19,band34,band58)
+
+plot(rgbRaster)
+
+hist(rgbRaster)
+```
+
+
+"SSDM", ham .csv veya .txt dosyalarını okumak için `load_occ` fonksiyonu kullanılır.  Paketteki örnekte Kaledonya'ya özgü beş Cryptocarya türünün doğal tarih kayıtları ile çalışacağız.
+
+```{r Natural history records}
+Occ <- load_occ(path = system.file('extdata',  package = 'SSDM'), Env,
+         Xcol = 'LONGITUDE', Ycol = 'LATITUDE',
+         file = 'Occurrences.csv', sep = ',', verbose = FALSE)
+
+head(Occ)
+
+```
+
+**Bunu not et:**
+
+-Çevresel veriler yüklendikten sonra olaylar kontrol edin bu nedenle çevresel veriler occurence'den önce yüklenmeli
+- Occurence'yi inceltmek için "GeoRes" seçeneğini kullanın. İnceltme, gereksiz (kümelenmiş) kayıtları kaldırarak, en fazla miktarda bilgiyi korurken örnekleme önyargısının etkisini azaltır.
+- Dosya açma sorunları olması durumunda, ham verilerinizi açmak için kullanılan "read.csv" işlevinin ek seçeneklerine bakın. 
+
+## Model algoritmaları
+
+### Bireysel tür dağıtım modelleri (SDM'ler)
+
+Aşağıdaki örnekte, türlerin oluşumlarının bir alt kümesiyle ve tek bir algoritma için, burada genelleştirilmiş doğrusal modellerle Cryptocarya * elliptica * 'nın dağılım modeli oluşturacağız. 'SSDM' paketi tür dağılımlarını modellemek için yaygın olarak kullanılan sekiz algoritmayı içermektedir: genelleştirilmiş eklemeli modeller= general additive models  (GAM), genelleştirilmiş doğrusal modeller = generalized linear models (GLM), çok değişkenli uyarlamalı regresyon eğrileri =multivariate adaptive regression splines (MARS), sınıflandırma ağacı analizi = classification tree analysis (CTA), genelleştirilmiş artırılmış modeller = generalized boosted models  (GBM ), maksimum entropi (MAXENT), yapay sinir ağları (YSA), Random Forest (RF) ve support vector machines (SVM). Her birininn bağlı olduğu bir R paketi vardır.
+
+```{r SDM}
+
+SDM <- modelling('GLM', subset(Occurrences, Occurrences$SPECIES == 'elliptica'), 
+                 Env, Xcol = 'LONGITUDE', Ycol = 'LATITUDE', verbose = FALSE)
+plot(SDM@projection, main = 'SDM\nfor Cryptocarya elliptica\nwith GLM algorithm')
+```
+
+
+### Topluluk tür dağılım modelleri (ESDM's = Ensemble species distribution models)
+
+Bu sonraki örnekte, bu türün CTA ve MARS tabanlı SDM'lerini birleştiren bir topluluk *elliptica* dağılım modeli oluşturuyoruz. Dağılım tahminlerindeki belirsizliği minimuma indirmek için; bir dizi alternatif model algoritmasını uygulamanızı önerilir. 
+Paket ayrıca, algoritmalar arası varyansı temsil eden bir belirsizlik haritası sağlar. Her bir algoritma çifti arasındaki uyum derecesi, Pearson katsayısını veren bir korelasyon matrisi aracılığıyla değerlendirilebilirsiniz.
+
+```{r ESDM}
+ESDM <- ensemble_modelling(c('CTA', 'MARS'), subset(Occurrences, Occurrences$SPECIES == 'elliptica'),
+                           Env, rep = 1, Xcol = 'LONGITUDE', Ycol = 'LATITUDE',
+                          ensemble.thresh = 0, verbose = FALSE)
+plot(ESDM@projection, main = 'ESDM\nfor Cryptocarya elliptica\nwith CTA and MARS algorithms')
+```
+
+
+### Yığılmış tür dağıtım modelleri (SSDM's)
+
+Son olarak, CTA ve SVM algoritmalarını ve birden çok türü kullanarak yığınlanmış tür dağılım modeli oluşturuyoruz. Farklı türlerin çıktıları, sürekli habitat uygunluk haritaları istifleme yöntemi (pSSDM) kullanılarak yerel tür zenginliği ve endemizmin SSDM haritalarında toplanır.
+
+```{r SSDM}
+
+#SSDM <- stack_modelling(c('CTA', 'SVM'), Occurrences, Env, rep = 1, ensemble.thresh = 0, Xcol = 'LONGITUDE', Ycol = "LATITUDE", Spcol = 'SPECIES', method = "pSSDM", verbose = F)
+
+#plot(SSDM@diversity.map, main = "SSDM\nfor Cryptocarya genus\nwith CTA and SVM algorithms")
+
+```
+
+
+## Çıktılar
+
+### Model doğruluğu değerlendirmesi
+
+"SDMTools" paketine dahil olan bir dizi model değerlendirme ölçütü, "SSDM" paketine entegre edilmiştir. Areceiving operating characteristic (ROC) eğrisinin (AUC) altındaki alanı, Cohen'in Kappa katsayısını, ihmal oranını, duyarlılığı (sentivity= gerçek pozitif oran) ve özgüllüğü (specificity = gerçek negatif oran) içerir. Bu ölçümlerin tümü, confusion matrix dayanır. confusion matrix, habitat uygunluk haritalarını ikili varlık / yokluk haritalarına dönüştürerek hesaplanır.
+Bu kriterlerin çoğu, yalnızca bir modelin discrimination kapasitesini test eder, ancak modelin görünmeyen veriler üzerinde ne kadar iyi performans gösterdiğini söylemez. Bu amaçla, uzay ve zaman üzerinden model aktarılabilirliği için önemli bir ölçü olan bir kalibrasyon ölçütü (Naimi & Arauja) de dahil edilmiştir (örneğin iklim değişikliği tahminleri için).
+
+```{r SDM evaluation}
+knitr::kable(ESDM@evaluation)
+```
+
+Bir SSDM'nin doğruluğunu değerlendirmek için, paket, modellenmiş tür topluluklarını sahada gözlemlenen bağımsız envanterlerden tür havuzlarıyla karşılaştırma fırsatı sunar. Altı değerlendirme ölçütü hesaplanır: 
+(1) species richness error : tahmin edilen ve gözlemlenen tür zenginliği arasındaki fark;
+(2) prediction success : doğru tahminlerin oranı; 
+(3) Cohen'in kappası; 
+(4) specificity özgüllüğü, yani gerçek negatiflerin oranı;
+(5) Sensivitiy: hassasiyeti, yani gerçek pozitiflerin oranı; ve 
+(6) topluluk benzerliğinin yaygın olarak kullanılan bir ölçütü olan Jaccard indeksi.
+
+```{r SSDM evaluation}
+
+#knitr::kable(SSDM@evaluation)
+
+```
+
+### Çevresel değişkenlerin önem analizi
+
+'SSDM' paketi, çevresel değişkenlerin nispi katkısını ölçmek için iki yöntem sunar ve bu, bir çevresel değişkenin tür dağılımını belirlemek için uygunluğunu ölçer. İlk yöntem, tam bir model ile her bir çevresel değişkenin sırayla ihmal edildiği modeller arasındaki doğruluktaki değişikliği değerlendiren bir jack knife yaklaşımına dayanmaktadır. Pakette bulunan tüm ölçümler, doğruluktaki değişikliği değerlendirmeye hizmet edebilir. İkinci yöntem, tam bir model ile her bir çevresel değişkenin sırayla ihmal edildiği modeller arasındaki Pearson korelasyon katsayısına dayanmaktadır.
+
+```{r SSDM variable importance}
+
+knitr::kable(SSDM@variable.importance)
+
+```
+
+### Endemizm haritalama
+
+Tür zenginliğine ek olarak, endemizm, türlerin tanımlanan coğrafi konuma özgü olması anlamına geldiğinden koruma için önemli bir özelliktir. Tür endemizm haritaları iki ölçüm kullanılarak hesaplanabilir:
+
+1. ağırlıklı endemizm endeksi (WEI)
+2. düzeltilmiş ağırlıklı endemizm endeksi
+
+```{r SSDM endemism}
+plot(SSDM@endemism.map, main = 'Endemism map\nfor Cryptocarya genus\nwith CTA and SVM algorithms')
+```
+
+
+### Özet Plot
+
+Tüm sonuçlar SSDM nesnesi üzerinde "plot" yöntemi ile özetlenebilir.
+
+```{r plot}
+#plot(SSDM)
+
+```
